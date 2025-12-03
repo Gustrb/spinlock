@@ -20,8 +20,12 @@ var (
 type Task[T any] func(context.Context) (T, error)
 
 type Future[T any] struct {
-	result chan T
-	err    chan error
+	ch chan outcome[T]
+}
+
+type outcome[T any] struct {
+	result T
+	err    error
 }
 
 type ThreadPool[T any] struct {
@@ -92,14 +96,12 @@ func (tp *ThreadPool[T]) SubmitWithContext(ctx context.Context, task Task[T]) (*
 	}
 
 	fut := &Future[T]{
-		result: make(chan T, 1),
-		err:    make(chan error, 1),
+		ch: make(chan outcome[T], 1),
 	}
 
 	fn := func() {
 		res, err := task(ctx)
-		fut.result <- res
-		fut.err <- err
+		fut.ch <- outcome[T]{result: res, err: err}
 	}
 
 	if !tp.safeSend(fn) {
@@ -125,14 +127,12 @@ func (tp *ThreadPool[T]) TrySubmitWithContext(ctx context.Context, task Task[T])
 	}
 
 	fut := &Future[T]{
-		result: make(chan T, 1),
-		err:    make(chan error, 1),
+		ch: make(chan outcome[T], 1),
 	}
 
 	fn := func() {
 		res, err := task(ctx)
-		fut.result <- res
-		fut.err <- err
+		fut.ch <- outcome[T]{result: res, err: err}
 	}
 
 	sent, queueFull := tp.safeTrySend(fn)
@@ -162,9 +162,8 @@ func (f *Future[T]) Get(ctx context.Context) (T, error) {
 	var zero T
 
 	select {
-	case res := <-f.result:
-		err := <-f.err
-		return res, err
+	case out := <-f.ch:
+		return out.result, out.err
 	case <-ctx.Done():
 		return zero, ctx.Err()
 	}
