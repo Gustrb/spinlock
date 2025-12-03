@@ -153,4 +153,131 @@ func TestTrySubmitShouldNotBlock_ChannelFull(t *testing.T) {
 	if !errors.Is(err, pool.ErrQueueFull) {
 		t.Fatalf("Expected ErrQueueFull, but got %v", err)
 	}
+
+	tp.Shutdown()
+}
+
+func TestSubmitWithTimeout_SubmissionTimeout(t *testing.T) {
+	tp := pool.NewThreadPool[int](0)
+
+	// Fill the queue with blocked tasks
+	blockers := make([]chan struct{}, pool.TaskQueueSize)
+	for i := range pool.TaskQueueSize {
+		blockers[i] = make(chan struct{})
+		_, err := tp.SubmitWithContext(context.Background(), func(ctx context.Context) (int, error) {
+			<-blockers[i]
+			return 0, nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	}
+
+	// Now queue is full, this should timeout
+	_, err := tp.SubmitWithTimeout(func(ctx context.Context) (int, error) {
+		return 123, nil
+	}, 10*time.Millisecond)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %#v", err)
+	}
+
+	for i := range blockers {
+		close(blockers[i])
+	}
+	tp.Shutdown()
+}
+
+func TestSubmitWithTimeout_TaskExecutionTimeout(t *testing.T) {
+	tp := pool.NewThreadPool[int](1)
+
+	fut, err := tp.SubmitWithTimeout(func(ctx context.Context) (int, error) {
+		select {
+		case <-time.After(200 * time.Millisecond):
+			return 1, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}, 50*time.Millisecond)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, taskErr := fut.Get(context.Background())
+
+	if !errors.Is(taskErr, context.DeadlineExceeded) {
+		t.Fatalf("expected task to timeout with DeadlineExceeded, got %#v", taskErr)
+	}
+}
+
+func TestSubmitWithTimeout_Success(t *testing.T) {
+	tp := pool.NewThreadPool[int](1)
+
+	fut, err := tp.SubmitWithTimeout(func(ctx context.Context) (int, error) {
+		return 99, nil
+	}, 100*time.Millisecond)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	val, futErr := fut.Get(context.Background())
+
+	if futErr != nil {
+		t.Fatalf("unexpected future error: %v", futErr)
+	}
+	if val != 99 {
+		t.Fatalf("expected 99, got %d", val)
+	}
+}
+
+func TestSubmitWithTimeout_ShutdownBeforeSubmit(t *testing.T) {
+	tp := pool.NewThreadPool[int](1)
+	tp.Shutdown()
+
+	_, err := tp.SubmitWithTimeout(func(ctx context.Context) (int, error) {
+		return 1, nil
+	}, 50*time.Millisecond)
+
+	if !errors.Is(err, pool.ErrPoolShutdown) {
+		t.Fatalf("expected ErrPoolShutdown, got %#v", err)
+	}
+}
+
+func TestSubmitWithTimeout_ShutdownDuringSubmit(t *testing.T) {
+	tp := pool.NewThreadPool[int](0)
+
+	// fill queue
+	blockers := make([]chan struct{}, pool.TaskQueueSize)
+	for i := range pool.TaskQueueSize {
+		blockers[i] = make(chan struct{})
+		tp.Submit(func(ctx context.Context) (int, error) {
+			<-blockers[i]
+			return 0, nil
+		})
+	}
+
+	// race: shutdown shortly after starting submit
+	done := make(chan error)
+
+	go func() {
+		_, err := tp.SubmitWithTimeout(func(ctx context.Context) (int, error) {
+			return 1, nil
+		}, 200*time.Millisecond)
+		done <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	tp.Shutdown()
+
+	err := <-done
+
+	if err != pool.ErrPoolShutdown && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected ErrPoolShutdown or DeadlineExceeded, got %#v", err)
+	}
+
+	for i := range blockers {
+		close(blockers[i])
+	}
 }

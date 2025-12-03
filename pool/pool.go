@@ -3,9 +3,9 @@ package pool
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -15,6 +15,7 @@ const (
 var (
 	ErrPoolShutdown = errors.New("pool is already closed")
 	ErrQueueFull    = errors.New("the queue is full")
+	ErrPanic        = errors.New("the queue panicked")
 )
 
 type Task[T any] func(context.Context) (T, error)
@@ -58,14 +59,22 @@ func NewThreadPool[T any](workers int) *ThreadPool[T] {
 
 // safe blocking send that recovers if channel was closed concurrently.
 // returns true if send succeeded; false if a panic happened (channel closed).
-func (tp *ThreadPool[T]) safeSend(fn func()) (ok bool) {
+func (tp *ThreadPool[T]) safeSend(ctx context.Context, fn func()) (err error) {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+
 	defer func() {
 		if r := recover(); r != nil {
-			ok = false
+			err = ErrPanic
 		}
 	}()
-	tp.tasks <- fn
-	return true
+
+	select {
+	case tp.tasks <- fn:
+		return nil
+	case <-ctx.Done():
+		return context.DeadlineExceeded
+	}
 }
 
 // safe non-blocking send (select) that recovers if channel closed.
@@ -73,6 +82,9 @@ func (tp *ThreadPool[T]) safeSend(fn func()) (ok bool) {
 // If sent==false && queueFull==true => queue was full (no send).
 // If sent==false && queueFull==false => send failed due to closed channel.
 func (tp *ThreadPool[T]) safeTrySend(fn func()) (sent bool, queueFull bool) {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+
 	defer func() {
 		if r := recover(); r != nil {
 			// panic => channel closed
@@ -83,7 +95,6 @@ func (tp *ThreadPool[T]) safeTrySend(fn func()) (sent bool, queueFull bool) {
 
 	select {
 	case tp.tasks <- fn:
-		fmt.Print("debug")
 		return true, false
 	default:
 		return false, true
@@ -104,8 +115,8 @@ func (tp *ThreadPool[T]) SubmitWithContext(ctx context.Context, task Task[T]) (*
 		fut.ch <- outcome[T]{result: res, err: err}
 	}
 
-	if !tp.safeSend(fn) {
-		return nil, ErrPoolShutdown
+	if err := tp.safeSend(ctx, fn); err != nil {
+		return nil, err
 	}
 
 	return fut, nil
@@ -145,6 +156,34 @@ func (tp *ThreadPool[T]) TrySubmitWithContext(ctx context.Context, task Task[T])
 	}
 
 	return nil, ErrPoolShutdown
+}
+
+func (tp *ThreadPool[T]) SubmitWithTimeout(task Task[T], timeout time.Duration) (*Future[T], error) {
+	if atomic.LoadInt32(&tp.shutdown) == 1 {
+		return nil, ErrPoolShutdown
+	}
+
+	fut := &Future[T]{
+		ch: make(chan outcome[T], 1),
+	}
+
+	// execution-time timeout
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	fn := func() {
+		defer cancel()
+		res, err := task(ctx)
+		fut.ch <- outcome[T]{result: res, err: err}
+	}
+
+	// submission-time timeout
+	submitCtx, submitCancel := context.WithTimeout(context.Background(), timeout)
+	defer submitCancel()
+
+	if err := tp.safeSend(submitCtx, fn); err != nil {
+		return nil, err
+	}
+
+	return fut, nil
 }
 
 func (tp *ThreadPool[T]) Shutdown() {
