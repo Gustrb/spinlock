@@ -132,3 +132,25 @@ func TestShutdownProperly(t *testing.T) {
 		t.Fatalf("expected ErrShutdown, got %v", err)
 	}
 }
+
+func TestTrySubmitShouldNotBlock_ChannelFull(t *testing.T) {
+	tp := pool.NewThreadPool[int](0)
+	defer tp.Shutdown()
+
+	for i := range pool.TaskQueueSize {
+		_, err := tp.Submit(func(ctx context.Context) (int, error) {
+			return i, nil
+		})
+		if err != nil {
+			t.Fatalf("Failed to submit task %d to fill buffer: %v", i, err)
+		}
+	}
+
+	_, err := tp.TrySubmit(func(ctx context.Context) (int, error) {
+		return 42, nil
+	})
+
+	if !errors.Is(err, pool.ErrQueueFull) {
+		t.Fatalf("Expected ErrQueueFull, but got %v", err)
+	}
+}
