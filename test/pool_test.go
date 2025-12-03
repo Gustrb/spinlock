@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 func TestShouldBeAbleToSubmitTasks(t *testing.T) {
 	tp := pool.NewThreadPool[int](10)
 
-	future := tp.Submit(func(_ context.Context) (int, error) {
+	future, _ := tp.Submit(func(_ context.Context) (int, error) {
 		return 10, nil
 	})
 
@@ -25,7 +26,7 @@ func TestShouldBeAbleToSubmitTasks(t *testing.T) {
 	if result != 10 {
 		t.Fatalf("Expected result to be 10, got: %d", result)
 	}
-	future = tp.Submit(func(_ context.Context) (int, error) {
+	future, _ = tp.Submit(func(_ context.Context) (int, error) {
 		return 0, errors.New("dummy err")
 	})
 
@@ -44,7 +45,7 @@ func TestShouldBeAbleToHandleConcurrentFutures(t *testing.T) {
 	for i := range 100 {
 		wg.Go(func() {
 			mu.Lock()
-			futureMap[i] = tp.Submit(func(_ context.Context) (int, error) {
+			futureMap[i], _ = tp.Submit(func(_ context.Context) (int, error) {
 				return i, nil
 			})
 			mu.Unlock()
@@ -68,7 +69,7 @@ func TestShouldBeAbleToHandleConcurrentFutures(t *testing.T) {
 func TestShouldBeAbleToHandleCancellation(t *testing.T) {
 	tp := pool.NewThreadPool[int](10)
 
-	future := tp.Submit(func(ctx context.Context) (int, error) {
+	future, _ := tp.Submit(func(ctx context.Context) (int, error) {
 		time.Sleep(time.Second * 10)
 		return 1, nil
 	})
@@ -86,8 +87,7 @@ func TestCancelPropagation(t *testing.T) {
 	tp := pool.NewThreadPool[int](10)
 
 	parentCtx, parentCancel := context.WithCancel(context.Background())
-
-	future := tp.SubmitWithContext(parentCtx, func(ctx context.Context) (int, error) {
+	future, _ := tp.SubmitWithContext(parentCtx, func(ctx context.Context) (int, error) {
 		select {
 		case <-time.After(10 * time.Second):
 			return 1, nil
@@ -102,5 +102,33 @@ func TestCancelPropagation(t *testing.T) {
 	_, err := future.Get(context.Background())
 	if err == nil {
 		t.Fatalf("expected task cancellation")
+	}
+}
+
+func TestShutdownProperly(t *testing.T) {
+	tp := pool.NewThreadPool[int](10)
+
+	var counter atomic.Int32
+
+	for range 100 {
+		tp.Submit(func(ctx context.Context) (int, error) {
+			time.Sleep(10 * time.Millisecond)
+			counter.Add(1)
+			return 0, nil
+		})
+	}
+
+	tp.Shutdown()
+
+	if counter.Load() != 100 {
+		t.Fatalf("expected all tasks to finish, got %d", counter.Load())
+	}
+
+	_, err := tp.Submit(func(ctx context.Context) (int, error) {
+		return 1, nil
+	})
+
+	if !errors.Is(err, pool.ErrPoolShutdown) {
+		t.Fatalf("expected ErrShutdown, got %v", err)
 	}
 }
